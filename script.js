@@ -57,7 +57,7 @@ const animateElements = () => {
             if (element.classList.contains('skill-card')) {
                 setTimeout(() => {
                     element.classList.add('animated');
-                }, 100 * (index % 6)); // Stagger by row with 6 items per conceptual row
+                }, 100 * (index % 5)); // Stagger by row with 5 items per conceptual row
             } else {
                 element.classList.add('animated');
             }
@@ -78,9 +78,14 @@ const addAltTextToImages = () => {
 
 // Run on page load
 window.addEventListener('load', () => {
-    animateElements();
-    addAltTextToImages();
+    setTimeout(() => {
+        animateElements();
+        addAltTextToImages();
+    }, 100); // Small delay to ensure DOM is fully loaded
 });
+
+// Ensure animations run on scroll too
+window.addEventListener('scroll', animateElements);
 
 // Smooth scrolling for anchor links
 document.querySelectorAll('a[href^="#"]').forEach(anchor => {

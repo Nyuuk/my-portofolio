@@ -428,8 +428,14 @@ footer {
     color: var(--text-secondary);
 }
 
-/* Animations */
+/* Remove the visible force class */
+/* Modify animation keyframes to ensure proper visibility */
 @keyframes fadeInUp {
+    from {
+        opacity: 0;
+        transform: translateY(30px);
+    }
+
     to {
         opacity: 1;
         transform: translateY(0);
