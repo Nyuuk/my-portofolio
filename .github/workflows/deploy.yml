@@ -1,0 +1,380 @@
+name: Deploy to Server
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options:
+          - development
+          - production
+      image_tag:
+        description: "Image tag to deploy (e.g., v1.0.0, dev, main)"
+        required: true
+        type: string
+      deploy_backend:
+        description: "Deploy backend"
+        required: false
+        default: true
+        type: boolean
+      deploy_frontend:
+        description: "Deploy frontend"
+        required: false
+        default: true
+        type: boolean
+      triggered_by:
+        description: "Trigger source"
+        required: false
+        default: "manual"
+        type: string
+      commit_sha:
+        description: "Commit SHA"
+        required: false
+        type: string
+      commit_author:
+        description: "Commit author"
+        required: false
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  deploy:
+    name: Deploy to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set lowercase image name
+        id: image
+        run: |
+          echo "name=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+
+      - name: Send Telegram notification - Deployment started
+        run: |
+          ENV_EMOJI="🔧"
+          if [[ "${{ inputs.environment }}" == "production" ]]; then
+            ENV_EMOJI="🏭"
+          fi
+
+          MESSAGE="${ENV_EMOJI} *POS System - Deployment Started*%0A%0A"
+          MESSAGE="${MESSAGE}*Environment:* ${{ inputs.environment }}%0A"
+          MESSAGE="${MESSAGE}*Image Tag:* \`${{ inputs.image_tag }}\`%0A"
+          MESSAGE="${MESSAGE}*Triggered By:* ${{ inputs.triggered_by }}%0A"
+
+          if [[ ! -z "${{ inputs.commit_sha }}" ]]; then
+            COMMIT_SHORT=$(echo "${{ inputs.commit_sha }}" | cut -c1-8)
+            MESSAGE="${MESSAGE}*Commit:* \`${COMMIT_SHORT}\`%0A"
+          fi
+
+          if [[ ! -z "${{ inputs.commit_author }}" ]]; then
+            MESSAGE="${MESSAGE}*Author:* ${{ inputs.commit_author }}%0A"
+          fi
+
+          MESSAGE="${MESSAGE}%0A*Components:*%0A"
+          if [[ "${{ inputs.deploy_backend }}" == "true" ]]; then
+            MESSAGE="${MESSAGE}• Backend: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:${{ inputs.image_tag }}-backend%0A"
+          fi
+          if [[ "${{ inputs.deploy_frontend }}" == "true" ]]; then
+            MESSAGE="${MESSAGE}• Frontend: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:${{ inputs.image_tag }}-frontend%0A"
+          fi
+
+          MESSAGE="${MESSAGE}%0ATransferring files and updating services...%0A"
+          MESSAGE="${MESSAGE}[View Workflow Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d "message_thread_id=${{ vars.TELEGRAM_TOPIC_ID }}" \
+            -d "text=${MESSAGE}" \
+            -d "parse_mode=Markdown" \
+            -d "disable_web_page_preview=true"
+
+      - name: Setup SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Add server to known hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -p ${{ vars.SSH_PORT || 22 }} -H ${{ vars.SSH_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Prepare environment files
+        run: |
+          # Determine which compose file to use
+          if [[ "${{ inputs.environment }}" == "production" ]]; then
+            COMPOSE_FILE="docker-compose.prod.yml"
+          else
+            COMPOSE_FILE="docker-compose.dev.yml"
+          fi
+
+          echo "Using compose file: ${COMPOSE_FILE}"
+
+          # Copy compose file for deployment
+          cp ${COMPOSE_FILE} docker-compose-deploy.yml
+
+          # Prepare .env files
+          cp backend/.env.example backend/.env
+          cp frontend/.env.example frontend/.env
+          cp .env.example .env
+
+          # Replace placeholders with actual values
+          sed -i 's|{{APP_DEBUG}}|${{ vars.APP_DEBUG || 'false' }}|g' backend/.env frontend/.env .env
+          sed -i 's|{{ENVIRONMENT}}|${{ inputs.environment }}|g' backend/.env frontend/.env .env
+          sed -i 's|{{POSTGRES_DB}}|${{ secrets.POSTGRES_DB }}|g' backend/.env frontend/.env .env
+          sed -i 's|{{POSTGRES_USER}}|${{ secrets.POSTGRES_USER }}|g' backend/.env frontend/.env .env
+          sed -i 's|{{POSTGRES_PASSWORD}}|${{ secrets.POSTGRES_PASSWORD }}|g' backend/.env frontend/.env .env
+          sed -i 's|{{COMMIT}}|${{ inputs.image_tag }}|g' backend/.env frontend/.env .env
+          sed -i 's|{{URL_BACKEND}}|${{ vars.URL_BACKEND }}|g' backend/.env frontend/.env .env
+          sed -i 's|{{URL_FRONTEND}}|${{ vars.URL_FRONTEND }}|g' backend/.env frontend/.env .env
+
+      - name: Transfer files to server
+        run: |
+          # Create deployment directory if not exists
+          ssh -p ${{ vars.SSH_PORT || 22 }} \
+            ${{ vars.SSH_USER }}@${{ vars.SSH_HOST }} \
+            "mkdir -p ${{ vars.DEPLOY_PATH }}"
+
+          # Transfer docker-compose file
+          scp -P ${{ vars.SSH_PORT || 22 }} \
+            docker-compose-deploy.yml \
+            ${{ vars.SSH_USER }}@${{ vars.SSH_HOST }}:${{ vars.DEPLOY_PATH }}/docker-compose-template.yml
+
+          # Transfer .env files
+          scp -P ${{ vars.SSH_PORT || 22 }} \
+            backend/.env \
+            ${{ vars.SSH_USER }}@${{ vars.SSH_HOST }}:${{ vars.DEPLOY_PATH }}/backend/.env
+
+          scp -P ${{ vars.SSH_PORT || 22 }} \
+            frontend/.env \
+            ${{ vars.SSH_USER }}@${{ vars.SSH_HOST }}:${{ vars.DEPLOY_PATH }}/frontend/.env
+
+          scp -P ${{ vars.SSH_PORT || 22 }} \
+            .env \
+            ${{ vars.SSH_USER }}@${{ vars.SSH_HOST }}:${{ vars.DEPLOY_PATH }}/.env
+
+      - name: Deploy to server
+        run: |
+          ssh -p ${{ vars.SSH_PORT || 22 }} \
+            ${{ vars.SSH_USER }}@${{ vars.SSH_HOST }} << 'ENDSSH'
+            cd ${{ vars.DEPLOY_PATH }}
+            
+            # Get current image tags from existing compose file
+            CURRENT_BACKEND=""
+            CURRENT_FRONTEND=""
+            IMAGE_NAME="${{ env.REGISTRY }}/${{ steps.image.outputs.name }}"
+            if [[ -f docker-compose.yml ]]; then
+              CURRENT_BACKEND=$(grep -o "${IMAGE_NAME}:[^[:space:]\"]*backend[^[:space:]\"]*" docker-compose.yml | head -1 || echo "")
+              CURRENT_FRONTEND=$(grep -o "${IMAGE_NAME}:[^[:space:]\"]*frontend[^[:space:]\"]*" docker-compose.yml | head -1 || echo "")
+            fi
+            
+            # Copy template to actual compose file
+            cp docker-compose-template.yml docker-compose.yml
+            
+            # Update image tags based on what should be deployed
+            if [[ "${{ inputs.deploy_backend }}" == "true" ]]; then
+              NEW_BACKEND="${IMAGE_NAME}:${{ inputs.image_tag }}-backend"
+              sed -i "s|image:.*backend.*|image: ${NEW_BACKEND}|g" docker-compose.yml
+              echo "Backend will be updated to: ${NEW_BACKEND}"
+            elif [[ ! -z "$CURRENT_BACKEND" ]]; then
+              # Keep existing backend image if not deploying
+              sed -i "s|image:.*backend.*|image: ${CURRENT_BACKEND}|g" docker-compose.yml
+              echo "Backend will keep current version: ${CURRENT_BACKEND}"
+            fi
+            
+            if [[ "${{ inputs.deploy_frontend }}" == "true" ]]; then
+              NEW_FRONTEND="${IMAGE_NAME}:${{ inputs.image_tag }}-frontend"
+              sed -i "s|image:.*frontend.*|image: ${NEW_FRONTEND}|g" docker-compose.yml
+              echo "Frontend will be updated to: ${NEW_FRONTEND}"
+            elif [[ ! -z "$CURRENT_FRONTEND" ]]; then
+              # Keep existing frontend image if not deploying
+              sed -i "s|image:.*frontend.*|image: ${CURRENT_FRONTEND}|g" docker-compose.yml
+              echo "Frontend will keep current version: ${CURRENT_FRONTEND}"
+            fi
+            
+            # Show final docker-compose.yml for debugging
+            echo "=========================================="
+            echo "Final docker-compose.yml:"
+            cat docker-compose.yml
+            echo "=========================================="
+            
+            # Login to GHCR
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
+            
+            # Pull latest images
+            echo "Pulling images..."
+            docker compose pull
+            
+            # Stop and remove old containers
+            echo "Stopping old containers..."
+            docker compose down
+            
+            # Start new containers
+            echo "Starting new containers..."
+            docker compose up -d --force-recreate
+            
+            # Run Laravel optimizations if backend was deployed
+            if [[ "${{ inputs.deploy_backend }}" == "true" ]]; then
+              echo "Running Laravel optimizations..."
+              sleep 5  # Wait for container to be ready
+              docker compose exec -T backend php artisan optimize || echo "Optimize failed, continuing..."
+              docker compose exec -T backend php artisan config:clear || echo "Config clear failed, continuing..."
+              docker compose exec -T backend php artisan storage:link || echo "Storage link failed, continuing..."
+            fi
+            
+            # Cleanup old images (keep last 7 days)
+            echo "Cleaning up old images..."
+            docker image prune -af --filter "until=168h"
+            
+            # Save deployment info
+            echo "${{ inputs.image_tag }}" > .last_deploy_tag
+            date > .last_deploy_time
+            
+            echo "Deployment completed!"
+          ENDSSH
+
+      - name: Health Check
+        id: health_check
+        continue-on-error: true
+        run: |
+          # Wait for services to start
+          echo "Waiting for services to start..."
+          sleep 30
+
+          # Check backend health
+          BACKEND_HEALTH="N/A"
+          if [[ "${{ inputs.deploy_backend }}" == "true" ]]; then
+            BACKEND_HEALTH=$(curl -s -o /dev/null -w "%{http_code}" "${{ vars.URL_BACKEND }}/api/health" || echo "Failed")
+            echo "Backend health status: $BACKEND_HEALTH"
+          fi
+
+          # Check frontend health
+          FRONTEND_HEALTH="N/A"
+          if [[ "${{ inputs.deploy_frontend }}" == "true" ]]; then
+            FRONTEND_HEALTH=$(curl -s -o /dev/null -w "%{http_code}" "${{ vars.URL_FRONTEND }}/" || echo "Failed")
+            echo "Frontend health status: $FRONTEND_HEALTH"
+          fi
+
+          # Save results
+          echo "backend_health=$BACKEND_HEALTH" >> $GITHUB_OUTPUT
+          echo "frontend_health=$FRONTEND_HEALTH" >> $GITHUB_OUTPUT
+
+          # Determine if health check passed
+          HEALTH_OK="true"
+          if [[ "${{ inputs.deploy_backend }}" == "true" && "$BACKEND_HEALTH" != "200" ]]; then
+            HEALTH_OK="false"
+          fi
+          if [[ "${{ inputs.deploy_frontend }}" == "true" && "$FRONTEND_HEALTH" != "200" ]]; then
+            HEALTH_OK="false"
+          fi
+          echo "health_ok=$HEALTH_OK" >> $GITHUB_OUTPUT
+
+      - name: Get Container Status
+        id: container_status
+        continue-on-error: true
+        run: |
+          CONTAINER_STATUS=$(ssh -p ${{ vars.SSH_PORT || 22 }} \
+            ${{ vars.SSH_USER }}@${{ vars.SSH_HOST }} \
+            "cd ${{ vars.DEPLOY_PATH }} && docker compose ps --format 'table {{.Name}}\t{{.Status}}' | grep -v 'NAME'" || echo "Failed to get status")
+
+          echo "container_status<<EOF" >> $GITHUB_OUTPUT
+          echo "$CONTAINER_STATUS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          # Check if all deployed containers are running
+          CONTAINERS_OK="true"
+          if echo "$CONTAINER_STATUS" | grep -v "Up" | grep -q "pos-"; then
+            CONTAINERS_OK="false"
+          fi
+          echo "containers_ok=$CONTAINERS_OK" >> $GITHUB_OUTPUT
+
+      - name: Send Telegram notification - Deployment result
+        if: always()
+        run: |
+          # Determine status
+          if [[ "${{ job.status }}" == "success" && "${{ steps.health_check.outputs.health_ok }}" == "true" && "${{ steps.container_status.outputs.containers_ok }}" == "true" ]]; then
+            STATUS="✅ *Successfully Deployed*"
+            COLOR="🟢"
+          elif [[ "${{ job.status }}" == "success" ]]; then
+            STATUS="⚠️ *Deployed with Issues*"
+            COLOR="🟠"
+          else
+            STATUS="❌ *Deployment Failed*"
+            COLOR="🔴"
+          fi
+
+          ENV_EMOJI="🔧"
+          if [[ "${{ inputs.environment }}" == "production" ]]; then
+            ENV_EMOJI="🏭"
+          fi
+
+          # Build container status
+          CONTAINERS_INFO="%0A*Container Status:*%0A"
+          while IFS= read -r line; do
+            if [[ ! -z "$line" && "$line" != "Failed to get status" ]]; then
+              CONTAINER_NAME=$(echo "$line" | awk '{print $1}')
+              CONTAINER_STATUS=$(echo "$line" | awk '{$1=""; print $0}' | xargs)
+              
+              if [[ "$CONTAINER_STATUS" == *"Up"* ]]; then
+                CONTAINERS_INFO="${CONTAINERS_INFO}• ${CONTAINER_NAME}: ✅ Running%0A"
+              else
+                CONTAINERS_INFO="${CONTAINERS_INFO}• ${CONTAINER_NAME}: ❌ ${CONTAINER_STATUS}%0A"
+              fi
+            fi
+          done <<< "${{ steps.container_status.outputs.container_status }}"
+
+          if [[ "${{ steps.container_status.outputs.container_status }}" == "Failed to get status" ]]; then
+            CONTAINERS_INFO="${CONTAINERS_INFO}❌ Could not retrieve status%0A"
+          fi
+
+          # Build health check info
+          HEALTH_INFO="%0A*Health Check:*%0A"
+          if [[ "${{ inputs.deploy_backend }}" == "true" ]]; then
+            BACKEND_STATUS="${{ steps.health_check.outputs.backend_health }}"
+            if [[ "$BACKEND_STATUS" == "200" ]]; then
+              HEALTH_INFO="${HEALTH_INFO}• Backend API: ✅ OK (200)%0A"
+            else
+              HEALTH_INFO="${HEALTH_INFO}• Backend API: ❌ Error (${BACKEND_STATUS})%0A"
+            fi
+          fi
+
+          if [[ "${{ inputs.deploy_frontend }}" == "true" ]]; then
+            FRONTEND_STATUS="${{ steps.health_check.outputs.frontend_health }}"
+            if [[ "$FRONTEND_STATUS" == "200" ]]; then
+              HEALTH_INFO="${HEALTH_INFO}• Frontend: ✅ OK (200)%0A"
+            else
+              HEALTH_INFO="${HEALTH_INFO}• Frontend: ❌ Error (${FRONTEND_STATUS})%0A"
+            fi
+          fi
+
+          # Build final message
+          MESSAGE="${COLOR} *POS System - Deployment Status*%0A%0A"
+          MESSAGE="${MESSAGE}${STATUS}%0A"
+          MESSAGE="${MESSAGE}*Environment:* ${ENV_EMOJI} ${{ inputs.environment }}%0A"
+          MESSAGE="${MESSAGE}*Image Tag:* \`${{ inputs.image_tag }}\`%0A"
+          MESSAGE="${MESSAGE}*Triggered By:* ${{ inputs.triggered_by }}%0A"
+
+          if [[ ! -z "${{ inputs.commit_sha }}" ]]; then
+            COMMIT_SHORT=$(echo "${{ inputs.commit_sha }}" | cut -c1-8)
+            MESSAGE="${MESSAGE}*Commit:* \`${COMMIT_SHORT}\`%0A"
+          fi
+
+          MESSAGE="${MESSAGE}%0A*URLs:*%0A"
+          MESSAGE="${MESSAGE}• Frontend: ${{ vars.URL_FRONTEND }}%0A"
+          MESSAGE="${MESSAGE}• Backend: ${{ vars.URL_BACKEND }}%0A"
+          MESSAGE="${MESSAGE}${CONTAINERS_INFO}"
+          MESSAGE="${MESSAGE}${HEALTH_INFO}"
+          MESSAGE="${MESSAGE}%0A[View Workflow Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d "message_thread_id=${{ vars.TELEGRAM_TOPIC_ID }}" \
+            -d "text=${MESSAGE}" \
+            -d "parse_mode=Markdown" \
+            -d "disable_web_page_preview=true"

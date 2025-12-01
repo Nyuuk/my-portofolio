@@ -1,0 +1,521 @@
+name: Development CI/CD Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_backend:
+        description: 'Force backend build & deploy'
+        required: false
+        default: false
+        type: boolean
+      force_frontend:
+        description: 'Force frontend build & deploy'
+        required: false
+        default: false
+        type: boolean
+  # push:
+  #   branches:
+  #     - dev
+  #   paths:
+  #     - 'backend/**'
+  #     - 'frontend/**'
+  #     - '.github/workflows/dev-cicd.yml'
+  #     - 'docker-compose.dev.yml'
+
+jobs:
+  detect-changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      backend_changed: ${{ steps.check-changes.outputs.backend_changed }}
+      frontend_changed: ${{ steps.check-changes.outputs.frontend_changed }}
+      docker_compose_changed: ${{ steps.check-changes.outputs.docker_compose_changed }}
+      commit_msg: ${{ steps.get-commit-info.outputs.commit_msg }}
+      commit_author: ${{ steps.get-commit-info.outputs.commit_author }}
+      commit_hash: ${{ steps.get-commit-info.outputs.commit_hash }}
+      changed_files: ${{ steps.get-commit-info.outputs.changed_files }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 2
+      
+      - name: Get commit info
+        id: get-commit-info
+        run: |
+          # Ambil informasi commit dengan handling yang lebih baik
+          COMMIT_MSG=$(git log -1 --pretty=%s)
+          COMMIT_AUTHOR=$(git log -1 --pretty=%an)
+          COMMIT_HASH=$(echo ${{ github.sha }} | cut -c1-8)
+          
+          # Ambil changed files dengan handling yang lebih aman
+          CHANGED_FILES=$(git diff --name-only HEAD^ HEAD | head -10 | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+          
+          # Bersihkan dan batasi panjang commit message
+          COMMIT_MSG=$(echo "$COMMIT_MSG" | head -c 100)
+          
+          # Escape karakter khusus untuk GitHub Actions
+          COMMIT_MSG="${COMMIT_MSG//\'/\'}"
+          COMMIT_MSG="${COMMIT_MSG//\"/\\\"}"
+          COMMIT_MSG="${COMMIT_MSG//$'\n'/ }"
+          COMMIT_MSG="${COMMIT_MSG//$'\r'/ }"
+          
+          COMMIT_AUTHOR="${COMMIT_AUTHOR//\'/\'}"
+          COMMIT_AUTHOR="${COMMIT_AUTHOR//\"/\\\"}"
+          
+          # Set output dengan format yang aman
+          {
+            echo "commit_msg=$COMMIT_MSG"
+            echo "commit_author=$COMMIT_AUTHOR" 
+            echo "commit_hash=$COMMIT_HASH"
+            echo "changed_files=$CHANGED_FILES"
+          } >> $GITHUB_OUTPUT
+      
+      - name: Check for changes
+        id: check-changes
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            if [[ "${{ github.event.inputs.force_backend }}" == "true" ]]; then
+              echo "backend_changed=true" >> $GITHUB_OUTPUT
+            else
+              echo "backend_changed=false" >> $GITHUB_OUTPUT
+            fi
+            
+            if [[ "${{ github.event.inputs.force_frontend }}" == "true" ]]; then
+              echo "frontend_changed=true" >> $GITHUB_OUTPUT
+            else
+              echo "frontend_changed=false" >> $GITHUB_OUTPUT
+            fi
+            exit 0
+          fi
+          
+          # Check changes in push event
+          git fetch origin
+          CHANGED_FILES=$(git diff --name-only HEAD^ HEAD)
+          
+          if echo "$CHANGED_FILES" | grep -q "^backend/"; then
+            echo "Changes detected in backend folder"
+            echo "backend_changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "No changes in backend folder"
+            echo "backend_changed=false" >> $GITHUB_OUTPUT
+          fi
+          
+          if echo "$CHANGED_FILES" | grep -q "^frontend/"; then
+            echo "Changes detected in frontend folder"
+            echo "frontend_changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "No changes in frontend folder"
+            echo "frontend_changed=false" >> $GITHUB_OUTPUT
+          fi
+          # if changes in .github/workflows/dev-cicd.yml or docker-compose.dev.yml
+          if echo "$CHANGED_FILES" | grep -qE "^\.github/workflows/dev-cicd\.yml|^docker-compose\.dev\.yml"; then
+            echo "Changes detected in workflow or compose file"
+            echo "backend_changed=true" >> $GITHUB_OUTPUT
+            echo "frontend_changed=true" >> $GITHUB_OUTPUT
+            echo "docker_compose_changed=true" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Send Telegram notification about changes
+        run: |
+          CHANGES=""
+          if [[ "${{ steps.check-changes.outputs.backend_changed }}" == "true" ]]; then
+            CHANGES="${CHANGES}• Backend%0A"
+          fi
+          if [[ "${{ steps.check-changes.outputs.frontend_changed }}" == "true" ]]; then
+            CHANGES="${CHANGES}• Frontend%0A"
+          fi
+          if [[ "${{ steps.check-changes.outputs.docker_compose_changed }}" == "true" ]]; then
+            CHANGES="${CHANGES}• Docker Compose%0A"
+          fi
+          
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TRIGGER="Manually triggered workflow"
+          else
+            TRIGGER="Push to \`${{ github.ref_name }}\` branch"
+          fi
+
+          # check if changes not found
+          if [[ -z "$CHANGES" ]]; then
+            CHANGES="No changes detected in backend or frontend folders."
+          fi
+          
+          MESSAGE="🚀 *POS System - Build Started*%0A%0A"
+          MESSAGE="${MESSAGE}*Trigger:* ${TRIGGER}%0A"
+          MESSAGE="${MESSAGE}*Commit:* \`${{ steps.get-commit-info.outputs.commit_hash }}\`%0A"
+          MESSAGE="${MESSAGE}*Author:* ${{ steps.get-commit-info.outputs.commit_author }}%0A"
+          MESSAGE="${MESSAGE}*Message:* ${{ steps.get-commit-info.outputs.commit_msg }}%0A%0A"
+          # build skiping when changes not detected
+          if [[ -z "$CHANGES" ]]; then
+            MESSAGE="${MESSAGE}No changes detected, skipping build and deployment. ✅"
+          else
+            MESSAGE="${MESSAGE}*Changes detected in:*%0A${CHANGES}%0A"
+            MESSAGE="${MESSAGE}Build and deployment will proceed... 🔄"
+          fi
+          
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d "message_thread_id=${{ vars.TELEGRAM_TOPIC_ID }}" \
+            -d "text=${MESSAGE}" \
+            -d "parse_mode=Markdown"
+  
+  backend-build:
+    name: Build Backend Image (Dev)
+    needs: detect-changes
+    if: needs.detect-changes.outputs.backend_changed == 'true' || github.event.inputs.force_backend == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      
+      - name: Set shortened commit hash
+        id: vars
+        run: echo "SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-5)" >> $GITHUB_OUTPUT
+      
+      - name: Build and push backend image
+        uses: docker/build-push-action@v4
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            dnanfab/uhaha:pos_backend_dev_${{ steps.vars.outputs.SHORT_SHA }}
+            dnanfab/uhaha:pos_backend_dev_latest
+          cache-from: type=registry,ref=dnanfab/uhaha:pos_backend_dev_latest
+          cache-to: type=inline
+  
+  frontend-build:
+    name: Build Frontend Image (Dev)
+    needs: detect-changes
+    if: needs.detect-changes.outputs.frontend_changed == 'true' || github.event.inputs.force_frontend == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      
+      - name: Set shortened commit hash
+        id: vars
+        run: echo "SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-5)" >> $GITHUB_OUTPUT
+      
+      # copy .env.example to frontend/.env
+      - name: Copy .env.example to frontend/.env
+        run: |
+          cp frontend/.env.example frontend/.env
+          sed -i 's|{{URL_BACKEND}}|${{ vars.DEV_URL_BACKEND }}|g' frontend/.env
+          cat frontend/.env
+      
+      - name: Build and push frontend image
+        uses: docker/build-push-action@v4
+        with:
+          context: ./frontend
+          file: ./frontend/docker/Dockerfile
+          push: true
+          platforms: linux/arm64
+          tags: |
+            dnanfab/uhaha:pos_frontend_dev_${{ steps.vars.outputs.SHORT_SHA }}
+            dnanfab/uhaha:pos_frontend_dev_latest
+          cache-from: type=registry,ref=dnanfab/uhaha:pos_frontend_dev_latest
+          cache-to: type=inline
+  
+  deploy:
+    name: Deploy to Dev Server
+    needs: [detect-changes, backend-build, frontend-build]
+    if: always() && (needs.detect-changes.outputs.backend_changed == 'true' || needs.detect-changes.outputs.frontend_changed == 'true' || github.event.inputs.force_backend == 'true' || github.event.inputs.force_frontend == 'true')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set shortened commit hash
+        id: vars
+        run: echo "SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-5)" >> $GITHUB_OUTPUT
+      
+      - name: Prepare environment variables
+        run: |
+          # Copy example env file
+          cp backend/.env.example backend/.env
+          cp frontend/.env.example frontend/.env
+          cp .env.example .env
+          
+          # Replace placeholders with actual values
+          sed -i 's|{{APP_DEBUG}}|true|g' backend/.env frontend/.env .env
+          sed -i 's|{{ENVIRONMENT}}|development|g' backend/.env frontend/.env .env
+          sed -i 's|{{POSTGRES_DB}}|${{ secrets.POSTGRES_DB_DEV }}|g' backend/.env frontend/.env .env
+          sed -i 's|{{POSTGRES_USER}}|${{ secrets.POSTGRES_USER_DEV }}|g' backend/.env frontend/.env .env
+          sed -i 's|{{POSTGRES_PASSWORD}}|${{ secrets.POSTGRES_PASSWORD_DEV }}|g' backend/.env frontend/.env .env
+          sed -i 's|{{COMMIT}}|${{ steps.vars.outputs.SHORT_SHA }}|g' backend/.env frontend/.env .env
+          sed -i 's|{{URL_BACKEND}}|${{ vars.DEV_URL_BACKEND }}|g' backend/.env frontend/.env .env
+          sed -i 's|{{URL_FRONTEND}}|${{ vars.DEV_URL_FRONTEND }}|g' backend/.env frontend/.env .env
+      
+      - name: Install Cloudflared
+        run: |
+          curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+          rm cloudflared.deb
+      
+      - name: Setup SSH via Cloudflared
+        run: |
+          # Create SSH config directory
+          mkdir -p ~/.ssh
+          
+          # Create SSH config file
+          cat > ~/.ssh/config << EOF
+          Host deployment-server
+              ProxyCommand cloudflared access ssh --hostname ${{ secrets.CLOUDFLARE_HOSTNAME }}
+              User ${{ vars.SERVER_USER }}
+              StrictHostKeyChecking no
+          EOF
+          
+          chmod 600 ~/.ssh/config
+
+      - name: Send Telegram notification - deployment started
+        run: |
+          MESSAGE="🔄 *POS System - Deployment Started* %0A%0A"
+          MESSAGE="${MESSAGE}*Environment:* Development%0A"
+          MESSAGE="${MESSAGE}*Commit:* \`${{ needs.detect-changes.outputs.commit_hash }}\` %0A"
+          
+          COMPONENTS=""
+          if [[ "${{ needs.detect-changes.outputs.backend_changed }}" == "true" ]]; then
+            COMPONENTS="${COMPONENTS}• Backend (dnanfab/uhaha:pos_backend_dev_${{ steps.vars.outputs.SHORT_SHA }}) %0A"
+          fi
+          if [[ "${{ needs.detect-changes.outputs.frontend_changed }}" == "true" ]]; then
+            COMPONENTS="${COMPONENTS}• Frontend (dnanfab/uhaha:pos_frontend_dev_${{ steps.vars.outputs.SHORT_SHA }}) %0A"
+          fi
+          
+          MESSAGE="${MESSAGE}*Deploying components:*%0A${COMPONENTS} %0A"
+          MESSAGE="${MESSAGE}Transferring files and restarting services..."
+          
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d "message_thread_id=${{ vars.TELEGRAM_TOPIC_ID }}" \
+            -d "text=${MESSAGE}" \
+            -d "parse_mode=Markdown"
+
+      - name: Deploy to server
+        env:
+          SERVER_USER: ${{ vars.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          DEV_DEPLOY_PATH: ${{ vars.DEV_DEPLOY_PATH }}
+        run: |
+          # Install sshpass for password authentication
+          sudo apt-get update && sudo apt-get install -y sshpass
+          
+          # Create deployment directory if not exists
+          sshpass -p "$SERVER_PASSWORD" ssh deployment-server "mkdir -p $DEV_DEPLOY_PATH"
+          
+          # Copy necessary files
+          sshpass -p "$SERVER_PASSWORD" scp docker-compose.dev.yml deployment-server:$DEV_DEPLOY_PATH/docker-compose-template.yml
+          sshpass -p "$SERVER_PASSWORD" scp backend/.env deployment-server:$DEV_DEPLOY_PATH/backend/.env
+          sshpass -p "$SERVER_PASSWORD" scp frontend/.env deployment-server:$DEV_DEPLOY_PATH/frontend/.env
+          sshpass -p "$SERVER_PASSWORD" scp .env deployment-server:$DEV_DEPLOY_PATH/.env
+          
+          # Execute deployment commands
+          sshpass -p "$SERVER_PASSWORD" ssh deployment-server << 'ENDSSH'
+            cd /home/nyuuk/server/pos-dev
+
+            # check if docker compose changed
+            CURRENT_BACKEND=$(grep -o "dnanfab/uhaha:pos_backend_dev_[a-zA-Z0-9_]*" docker-compose.yml 2>/dev/null || echo "")
+            CURRENT_FRONTEND=$(grep -o "dnanfab/uhaha:pos_frontend_dev_[a-zA-Z0-9_]*" docker-compose.yml 2>/dev/null || echo "")
+
+            if [[ "${{ needs.detect-changes.outputs.docker_compose_changed }}" == "true" || ! -f docker-compose.yml ]]; then
+              # Copy the updated docker-compose file
+              cp docker-compose-template.yml docker-compose.yml
+            fi
+
+            backend_build_status="${{ needs.backend-build.result }}"
+            frontend_build_status="${{ needs.frontend-build.result }}"
+
+            # Update image versions in docker-compose.yml
+            # backend
+            if [[ "${{ needs.detect-changes.outputs.backend_changed }}" == "true" || "${{ github.event.inputs.force_backend }}" == "true" ]]; then
+              if [[ "$backend_build_status" == "success" ]]; then
+                sed -i 's|\(dnanfab/uhaha:pos_backend_dev\)[^[:space:]"]*|dnanfab/uhaha:pos_backend_dev_${{ steps.vars.outputs.SHORT_SHA }}|g' docker-compose.yml
+              else
+                echo "===========Backend build failed, skipping deployment==========="
+              fi
+            elif [[ ! -z "$CURRENT_BACKEND" ]]; then
+              sed -i "s|\(dnanfab/uhaha:pos_backend_dev\)[^[:space:]\"]*|$CURRENT_BACKEND|g" docker-compose.yml
+            fi
+            
+            # frontend
+            if [[ "${{ needs.detect-changes.outputs.frontend_changed }}" == "true" || "${{ github.event.inputs.force_frontend }}" == "true" ]]; then
+              if [[ "$frontend_build_status" == "success" ]]; then
+                sed -i 's|\(dnanfab/uhaha:pos_frontend_dev\)[^[:space:]"]*|dnanfab/uhaha:pos_frontend_dev_${{ steps.vars.outputs.SHORT_SHA }}|g' docker-compose.yml
+              else
+                echo "===========Frontend build failed, skipping deployment==========="
+              fi
+            elif [[ ! -z "$CURRENT_FRONTEND" ]]; then
+              sed -i "s|\(dnanfab/uhaha:pos_frontend_dev\)[^[:space:]\"]*|$CURRENT_FRONTEND|g" docker-compose.yml
+            fi
+            
+            # Show the updated file for debugging
+            echo "Updated docker-compose.yml:"
+            cat docker-compose.yml
+
+            docker login -u ${{ vars.DOCKERHUB_USERNAME }} -p ${{ secrets.DOCKERHUB_TOKEN }}
+
+            # pulling latest image
+            docker compose pull
+            
+            # Start or restart containers
+            echo "Deploying to path: ${{ vars.DEV_DEPLOY_PATH }}"
+            docker compose down
+            docker compose up -d --force-recreate
+            # optimize
+            docker compose exec backend php artisan optimize
+            docker compose exec backend php artisan config:clear
+            docker compose exec backend php artisan storage:link
+            
+            # Cleanup old images (keep images from last 7 days)
+            docker image prune -af --filter "until=168h"
+            
+            # Save deployment info for health check
+            echo "${{ steps.vars.outputs.SHORT_SHA }}" > .last_deploy_sha
+          ENDSSH
+      
+      - name: Health Check
+        id: health_check
+        continue-on-error: true
+        run: |
+          # Wait for services to start
+          sleep 20
+          
+          # Check API health
+          BACKEND_HEALTH=$(curl -s -o /dev/null -w "%{http_code}" ${{ vars.DEV_URL_BACKEND }}/api/health || echo "Failed")
+          echo "Backend health status code: $BACKEND_HEALTH"
+          
+          # Check Frontend availability
+          FRONTEND_HEALTH=$(curl -s -o /dev/null -w "%{http_code}" ${{ vars.DEV_URL_FRONTEND }}/ || echo "Failed")
+          echo "Frontend health status code: $FRONTEND_HEALTH"
+          
+          # Save results for notification
+          echo "backend_health=$BACKEND_HEALTH" >> $GITHUB_OUTPUT
+          echo "frontend_health=$FRONTEND_HEALTH" >> $GITHUB_OUTPUT
+          
+          # Check if everything is okay
+          if [[ "$BACKEND_HEALTH" == "200" && "$FRONTEND_HEALTH" == "200" ]]; then
+            echo "health_ok=true" >> $GITHUB_OUTPUT
+          else
+            echo "health_ok=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Get Container Status
+        id: container_status
+        continue-on-error: true
+        env:
+          SERVER_USER: ${{ vars.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          DEV_DEPLOY_PATH: ${{ vars.DEV_DEPLOY_PATH }}
+        run: |
+          # Get container status
+          CONTAINER_STATUS=$(sshpass -p "$SERVER_PASSWORD" ssh deployment-server "cd /home/nyuuk/server/pos-dev && docker compose ps --format 'table {{.Name}}\t{{.Status}}' | grep -v 'NAME'" || echo "Failed to get container status")
+          echo "container_status<<EOF" >> $GITHUB_OUTPUT
+          echo "$CONTAINER_STATUS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          # Check if all containers are running
+          if echo "$CONTAINER_STATUS" | grep -v "Up"; then
+            CONTAINERS_OK="false"
+          else
+            CONTAINERS_OK="true"
+          fi
+          echo "containers_ok=$CONTAINERS_OK" >> $GITHUB_OUTPUT
+      
+      - name: Send Telegram notification - deployment result
+        if: always()
+        run: |
+          if [[ "${{ job.status }}" == "success" && "${{ steps.health_check.outputs.health_ok }}" == "true" && "${{ steps.container_status.outputs.containers_ok }}" == "true" ]]; then
+            STATUS="✅ *Successfully Deployed*"
+            COLOR="🟢"
+          # elif backend and frontend build are not successful
+          elif [[ "${{ needs.backend-build.result }}" != "success" || "${{ needs.frontend-build.result }}" != "success" ]]; then
+            STATUS="⚠️ *Deployment Completed with Issues*"
+            COLOR="🟠"
+          else
+            STATUS="⚠️ *Deployment Completed with Issues*"
+            COLOR="🟠"
+            
+            if [[ "${{ job.status }}" != "success" ]]; then
+              STATUS="❌ *Deployment Failed*"
+              COLOR="🔴"
+            fi
+          fi
+          
+          # Format container status
+          CONTAINERS_INFO="%0A*Container Status:*%0A"
+          while IFS= read -r line; do
+            if [[ ! -z "$line" && "$line" != "Failed to get container status" ]]; then
+              CONTAINER_NAME=$(echo "$line" | awk '{print $1}')
+              CONTAINER_STATUS=$(echo "$line" | awk '{$1=""; print $0}' | xargs)
+              
+              if [[ "$CONTAINER_STATUS" == *"Up"* ]]; then
+                CONTAINERS_INFO="${CONTAINERS_INFO}• ${CONTAINER_NAME}: ✅ Running%0A"
+              else
+                CONTAINERS_INFO="${CONTAINERS_INFO}• ${CONTAINER_NAME}: ❌ ${CONTAINER_STATUS}%0A"
+              fi
+            fi
+          done <<< "${{ steps.container_status.outputs.container_status }}"
+          
+          if [[ "${{ steps.container_status.outputs.container_status }}" == "Failed to get container status" ]]; then
+            CONTAINERS_INFO="${CONTAINERS_INFO}❌ Could not retrieve container status%0A"
+          fi
+          
+          # Health check info
+          HEALTH_INFO="%0A*Health Check:*%0A"
+          if [[ "${{ steps.health_check.outputs.backend_health }}" == "200" ]]; then
+            HEALTH_INFO="${HEALTH_INFO}• Backend API: ✅ OK (200)%0A"
+          else
+            HEALTH_INFO="${HEALTH_INFO}• Backend API: ❌ Error (${{ steps.health_check.outputs.backend_health }})%0A"
+          fi
+          
+          if [[ "${{ steps.health_check.outputs.frontend_health }}" == "200" ]]; then
+            HEALTH_INFO="${HEALTH_INFO}• Frontend: ✅ OK (200)%0A"
+          else
+            HEALTH_INFO="${HEALTH_INFO}• Frontend: ❌ Error (${{ steps.health_check.outputs.frontend_health }})%0A"
+          fi
+          
+          # Build the message
+          MESSAGE="${COLOR} *POS System - Deployment Status*%0A%0A"
+          MESSAGE="${MESSAGE}${STATUS}%0A"
+          MESSAGE="${MESSAGE}*Environment:* Development%0A"
+          MESSAGE="${MESSAGE}*Commit:* \`${{ needs.detect-changes.outputs.commit_hash }}\`%0A"
+          MESSAGE="${MESSAGE}*URLs:*%0A"
+          MESSAGE="${MESSAGE}• Frontend: ${{ vars.DEV_URL_FRONTEND }}%0A"
+          MESSAGE="${MESSAGE}• Backend: ${{ vars.DEV_URL_BACKEND }}%0A"
+          MESSAGE="${MESSAGE}${CONTAINERS_INFO}"
+          MESSAGE="${MESSAGE}${HEALTH_INFO}"
+          
+          # Add footer with links
+          MESSAGE="${MESSAGE}%0A[View Commit](https://github.com/${{ github.repository }}/commit/${{ github.sha }}) | [View Workflow Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+          
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d "message_thread_id=${{ vars.TELEGRAM_TOPIC_ID }}" \
+            -d "text=${MESSAGE}" \
+            -d "parse_mode=Markdown" \
+            -d "disable_web_page_preview=true"
